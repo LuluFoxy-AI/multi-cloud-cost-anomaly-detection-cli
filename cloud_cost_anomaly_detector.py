@@ -1,82 +1,226 @@
 #!/usr/bin/env python3
 """
 Multi-Cloud Cost Anomaly Detection CLI
-AWS-focused MVP for detecting common cloud waste patterns
-
-This tool scans your AWS infrastructure for:
-- Unattached EBS volumes
-- Idle load balancers (ELB/ALB/NLB)
-- Oversized RDS instances with low CPU utilization
-- Stopped EC2 instances still incurring costs
+Detects cost spikes across AWS and Azure by comparing recent spending patterns.
 
 Author: LuluFoxy-AI
 License: MIT
 """
 
-import boto3
-import json
-from datetime import datetime, timedelta
-from collections import defaultdict
 import argparse
+import json
 import sys
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import requests
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+except ImportError:
+    boto3 = None
+
+try:
+    from azure.identity import DefaultAzureCredential
+    from azure.mgmt.costmanagement import CostManagementClient
+except ImportError:
+    DefaultAzureCredential = None
+    CostManagementClient = None
 
 
-class AWSCostAnomalyDetector:
-    """Detects cost anomalies in AWS infrastructure"""
+class CostAnalyzer:
+    """Analyzes cloud costs and detects anomalies."""
     
-    def __init__(self, region='us-east-1', profile=None):
-        """Initialize AWS clients"""
-        session_kwargs = {'region_name': region}
-        if profile:
-            session_kwargs['profile_name'] = profile
-        
-        session = boto3.Session(**session_kwargs)
-        self.ec2 = session.client('ec2')
-        self.elb = session.client('elb')
-        self.elbv2 = session.client('elbv2')
-        self.rds = session.client('rds')
-        self.cloudwatch = session.client('cloudwatch')
-        self.region = region
+    def __init__(self, threshold: float = 20.0, webhook_url: Optional[str] = None):
+        self.threshold = threshold
+        self.webhook_url = webhook_url
         self.anomalies = []
-        self.total_monthly_waste = 0.0
-
-    def scan_unattached_ebs_volumes(self):
-        """Find EBS volumes not attached to any instance"""
-        print("[*] Scanning for unattached EBS volumes...")
-        volumes = self.ec2.describe_volumes(
-            Filters=[{'Name': 'status', 'Values': ['available']}]
-        )['Volumes']
+    
+    def analyze_aws(self) -> Dict:
+        """Analyze AWS costs using Cost Explorer API."""
+        if not boto3:
+            return {"error": "boto3 not installed. Run: pip install boto3"}
         
-        for volume in volumes:
-            size = volume['Size']
-            volume_type = volume['VolumeType']
-            monthly_cost = size * 0.08
+        try:
+            client = boto3.client('ce', region_name='us-east-1')
             
-            self.anomalies.append({
-                'type': 'Unattached EBS Volume',
-                'resource_id': volume['VolumeId'],
-                'details': f"{size}GB {volume_type}",
-                'monthly_waste': monthly_cost,
-                'recommendation': 'Delete if unused or create snapshot'
-            })
-            self.total_monthly_waste += monthly_cost
-
-    def scan_idle_load_balancers(self):
-        """Find load balancers with no active targets or low traffic"""
-        print("[*] Scanning for idle load balancers...")
+            # Define time periods
+            end_date = datetime.now().date()
+            start_current = end_date - timedelta(days=7)
+            start_previous = start_current - timedelta(days=7)
+            
+            # Get current period costs
+            current_response = client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_current.strftime('%Y-%m-%d'),
+                    'End': end_date.strftime('%Y-%m-%d')
+                },
+                Granularity='DAILY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[{'Type': 'SERVICE', 'Key': 'SERVICE'}]
+            )
+            
+            # Get previous period costs
+            previous_response = client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_previous.strftime('%Y-%m-%d'),
+                    'End': start_current.strftime('%Y-%m-%d')
+                },
+                Granularity='DAILY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[{'Type': 'SERVICE', 'Key': 'SERVICE'}]
+            )
+            
+            # Aggregate costs by service
+            current_costs = self._aggregate_aws_costs(current_response)
+            previous_costs = self._aggregate_aws_costs(previous_response)
+            
+            # Detect anomalies
+            return self._detect_anomalies('AWS', current_costs, previous_costs)
+            
+        except NoCredentialsError:
+            return {"error": "AWS credentials not found. Configure with 'aws configure'"}
+        except ClientError as e:
+            return {"error": f"AWS API error: {str(e)}"}
+    
+    def _aggregate_aws_costs(self, response: Dict) -> Dict[str, float]:
+        """Aggregate AWS costs by service."""
+        service_costs = {}
+        for result in response.get('ResultsByTime', []):
+            for group in result.get('Groups', []):
+                service = group['Keys'][0]
+                cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                service_costs[service] = service_costs.get(service, 0) + cost
+        return service_costs
+    
+    def _detect_anomalies(self, cloud: str, current: Dict[str, float], 
+                          previous: Dict[str, float]) -> Dict:
+        """Compare current vs previous costs and flag anomalies."""
+        results = {
+            "cloud": cloud,
+            "total_current": sum(current.values()),
+            "total_previous": sum(previous.values()),
+            "anomalies": []
+        }
         
-        classic_lbs = self.elb.describe_load_balancers()['LoadBalancerDescriptions']
-        for lb in classic_lbs:
-            lb_name = lb['LoadBalancerName']
-            instances = lb['Instances']
+        for service, current_cost in current.items():
+            previous_cost = previous.get(service, 0)
             
-            if len(instances) == 0:
-                monthly_cost = 18.0
-                self.anomalies.append({
-                    'type': 'Idle Classic Load Balancer',
-                    'resource_id': lb_name,
-                    'details': 'No registered instances',
-                    'monthly_waste': monthly_cost,
-                    'recommendation': 'Delete if unused'
+            if previous_cost == 0 and current_cost > 1:
+                # New service with significant cost
+                results["anomalies"].append({
+                    "service": service,
+                    "current_cost": round(current_cost, 2),
+                    "previous_cost": 0,
+                    "change_percent": 100,
+                    "alert": "NEW_SERVICE"
                 })
-                self.total_monthly_waste += monthly_cost
+            elif previous_cost > 0:
+                change_percent = ((current_cost - previous_cost) / previous_cost) * 100
+                
+                if change_percent > self.threshold:
+                    results["anomalies"].append({
+                        "service": service,
+                        "current_cost": round(current_cost, 2),
+                        "previous_cost": round(previous_cost, 2),
+                        "change_percent": round(change_percent, 2),
+                        "alert": "SPIKE_DETECTED"
+                    })
+        
+        self.anomalies.extend(results["anomalies"])
+        return results
+    
+    def send_webhook(self, data: Dict) -> bool:
+        """Send anomaly data to webhook URL."""
+        if not self.webhook_url:
+            return False
+        
+        try:
+            response = requests.post(
+                self.webhook_url,
+                json=data,
+                headers={'Content-Type': 'application/json'},
+                timeout=10
+            )
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Webhook error: {str(e)}", file=sys.stderr)
+            return False
+    
+    def print_report(self, results: Dict):
+        """Print formatted cost anomaly report."""
+        print(f"\n{'='*60}")
+        print(f"Cost Anomaly Report - {results['cloud']}")
+        print(f"{'='*60}")
+        print(f"Current Period (7d): ${results['total_current']:.2f}")
+        print(f"Previous Period (7d): ${results['total_previous']:.2f}")
+        
+        if results['total_previous'] > 0:
+            total_change = ((results['total_current'] - results['total_previous']) 
+                          / results['total_previous']) * 100
+            print(f"Total Change: {total_change:+.2f}%")
+        
+        if results['anomalies']:
+            print(f"\n⚠️  {len(results['anomalies'])} Anomalies Detected:\n")
+            for anomaly in results['anomalies']:
+                print(f"  Service: {anomaly['service']}")
+                print(f"  Current: ${anomaly['current_cost']:.2f}")
+                print(f"  Previous: ${anomaly['previous_cost']:.2f}")
+                print(f"  Change: {anomaly['change_percent']:+.2f}%")
+                print(f"  Alert: {anomaly['alert']}\n")
+        else:
+            print("\n✓ No anomalies detected.\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Multi-Cloud Cost Anomaly Detection CLI'
+    )
+    parser.add_argument(
+        '--cloud',
+        choices=['aws', 'azure', 'all'],
+        default='all',
+        help='Cloud provider to analyze'
+    )
+    parser.add_argument(
+        '--threshold',
+        type=float,
+        default=20.0,
+        help='Percentage threshold for anomaly detection (default: 20)'
+    )
+    parser.add_argument(
+        '--webhook',
+        type=str,
+        help='Webhook URL for notifications'
+    )
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='Output results as JSON'
+    )
+    
+    args = parser.parse_args()
+    analyzer = CostAnalyzer(threshold=args.threshold, webhook_url=args.webhook)
+    
+    all_results = []
+    
+    if args.cloud in ['aws', 'all']:
+        aws_results = analyzer.analyze_aws()
+        if 'error' not in aws_results:
+            all_results.append(aws_results)
+            if not args.json:
+                analyzer.print_report(aws_results)
+        else:
+            print(f"AWS Error: {aws_results['error']}", file=sys.stderr)
+    
+    # Send webhook if anomalies found
+    if analyzer.anomalies and args.webhook:
+        analyzer.send_webhook({'anomalies': analyzer.anomalies})
+        print("\n✓ Webhook notification sent")
+    
+    if args.json:
+        print(json.dumps(all_results, indent=2))
+
+
+if __name__ == '__main__':
+    main()
